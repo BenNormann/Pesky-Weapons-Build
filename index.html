@@ -36,6 +36,10 @@
       window.PESKY_ICE_SERVERS = [
         { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }
       ];
+      // The relay fallback (docs/WEB-BUILD.md "The relay"; relay/README.md): a WebSocket relay on Railway
+      // for browsers that cannot reach each other directly (campus wifi). Empty = off; the game then plays
+      // exactly as without one, and a relay that is down or unpaid changes nothing either.
+      window.PESKY_RELAY_URL = 'wss://pesky-weapons-production.up.railway.app';
     </script>
     <!-- keys.js and net.js are small and change without a Unity rebuild; a per-load stamp keeps a stale copy from ever being served from cache. -->
     <script>document.write('<script src="keys.js?v=' + Date.now() + '"><\/script>');</script>

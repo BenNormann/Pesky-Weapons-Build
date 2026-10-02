@@ -185,6 +185,9 @@
   var sendAction = null;
   var currentRoomCode = null;
   var selfIdCached = null;
+  // The relay fallback (docs/WEB-BUILD.md "The relay"): see the section below.
+  var relayUrl = '', relayForced = false, relaySocket = null, relayOpen = false, relayPeers = {};
+  var relayRetry = null, relayBackoffMs = 3000;
   var isHostSession = false;
 
   var localSink = null;    // spike page event receiver
@@ -404,6 +407,114 @@
     return null;
   }
 
+  // ---- the relay fallback (docs/WEB-BUILD.md "The relay") ---------------
+  // A WebSocket relay (relay/server.js, on Railway) for the peers this browser cannot reach over
+  // WebRTC: campus wifi with client isolation, UDP filtered, or the public signaling relays blocked.
+  // It is opened beside the WebRTC room, for the same code and the same peer id, so Unity sees one
+  // peer whichever way the packets travel. Each packet goes over WebRTC when that peer's connection
+  // is up and over the relay otherwise. No relay URL on the page, or a relay that is down, stopped or
+  // unpaid, and this whole section does nothing: the game is the plain WebRTC game of before.
+  //   wss://<host>/room/<CODE>?id=<peerId>
+  //   text, server to client: {t:'hello',id,peers:[...]} {t:'join',id} {t:'leave',id}
+  //   binary, client to server: [toLen][to][payload] (toLen 0 = everyone), server to client: [fromLen][from][payload]
+
+  function relayUrlFromPage() {
+    try {
+      var u = window.PESKY_RELAY_URL;
+      if (u && typeof u === 'string') return u.replace(/\/+$/, '');
+    } catch (e) { }
+    return '';
+  }
+
+  function connectRelay() {
+    if (!relayUrl || !currentRoomCode || relaySocket) return;
+    var url = relayUrl + '/room/' + encodeURIComponent(currentRoomCode) + '?id=' + encodeURIComponent(selfIdCached || '');
+    var ws;
+    try { ws = new WebSocket(url); } catch (e) { log('relay: cannot open', url, e && e.message); scheduleRelayRetry(); return; }
+    ws.binaryType = 'arraybuffer';
+    relaySocket = ws;
+    ws.onopen = function () {
+      if (relaySocket !== ws) return;
+      relayOpen = true;
+      relayBackoffMs = 3000;
+      log('relay: connected', url);
+    };
+    ws.onmessage = function (ev) { if (relaySocket === ws) onRelayMessage(ev.data); };
+    ws.onerror = function () { if (relaySocket === ws) log('relay: socket error (is the relay up?)'); };
+    ws.onclose = function (ev) {
+      if (relaySocket !== ws) return;
+      relaySocket = null;
+      relayOpen = false;
+      var gone = Object.keys(relayPeers);
+      relayPeers = {};
+      gone.forEach(function (id) { if (!rtcConnected(id)) markPeerGone(id, 'relay closed'); });
+      log('relay: closed', ev && ev.code, ev && ev.reason);
+      scheduleRelayRetry();
+    };
+  }
+
+  function scheduleRelayRetry() {
+    if (relayRetry || !currentRoomCode) return;
+    relayRetry = setTimeout(function () {
+      relayRetry = null;
+      if (currentRoomCode && !relaySocket) connectRelay();
+    }, relayBackoffMs);
+    relayBackoffMs = Math.min(relayBackoffMs * 2, 30000);
+  }
+
+  function disconnectRelay() {
+    if (relayRetry) { clearTimeout(relayRetry); relayRetry = null; }
+    var ws = relaySocket;
+    relaySocket = null;
+    relayOpen = false;
+    relayPeers = {};
+    if (ws) { try { ws.onclose = null; ws.close(1000, 'leaving'); } catch (e) { } }
+  }
+
+  function onRelayMessage(data) {
+    if (typeof data === 'string') {
+      var msg;
+      try { msg = JSON.parse(data); } catch (e) { return; }
+      if (msg.t === 'hello') {
+        (msg.peers || []).forEach(function (id) { relayPeers[id] = true; markPeerAlive(id, 'relay hello'); });
+        log('relay: in room with', (msg.peers || []).length, 'peer(s)');
+      } else if (msg.t === 'join') {
+        relayPeers[msg.id] = true;
+        markPeerAlive(msg.id, 'relay join');
+      } else if (msg.t === 'leave') {
+        delete relayPeers[msg.id];
+        if (!rtcConnected(msg.id)) markPeerGone(msg.id, 'relay leave');
+      }
+      return;
+    }
+    var bytes = toUint8(data);
+    if (!bytes || bytes.length < 1) return;
+    var fromLen = bytes[0];
+    if (1 + fromLen > bytes.length) return;
+    var from = String.fromCharCode.apply(null, bytes.subarray(1, 1 + fromLen));
+    var payload = bytes.subarray(1 + fromLen);
+    stats.rx++;
+    relayPeers[from] = true;
+    markPeerAlive(from, 'relay packet');
+    emit('OnNetMessage', from + '|' + bytesToB64(payload));
+  }
+
+  // Is this peer's WebRTC connection up? Then packets go that way and the relay is left alone.
+  function rtcConnected(peerId) {
+    try { return !!(room && room.getPeers()[peerId]); } catch (e) { return false; }
+  }
+
+  function relaySend(to, bytes) {
+    if (!relayOpen || !relaySocket) return false;
+    var toCodes = [];
+    for (var i = 0; i < (to || '').length; i++) toCodes.push(to.charCodeAt(i) & 255);
+    var frame = new Uint8Array(1 + toCodes.length + bytes.length);
+    frame[0] = toCodes.length;
+    frame.set(toCodes, 1);
+    frame.set(bytes, 1 + toCodes.length);
+    try { relaySocket.send(frame); return true; } catch (e) { return false; }
+  }
+
   // ---- diagnostics -----------------------------------------------------
 
   function logRelayChanges() {
@@ -449,9 +560,10 @@
       stats.lastRx = stats.rx;
     }, 1000);
     relayWatchdog = setTimeout(function () {
-      if (!anyRelayOpen()) {
-        emit('OnNetError', 'no signaling relay connected after 12s — network or relay outage');
-      }
+      if (anyRelayOpen()) return;
+      // No public signaling relay, but our own relay is up: the room still forms through it.
+      if (relayOpen) { log('no signaling relay after 12s; carrying on through the relay'); return; }
+      emit('OnNetError', 'no signaling relay connected after 12s — network or relay outage');
     }, 12000);
   }
 
@@ -782,6 +894,21 @@
     log('joining room', currentRoomCode, isHostSession ? '(host)' : '(client)',
         'appId:', APP_ID);
 
+    relayUrl = relayUrlFromPage();
+    relayForced = !!relayUrl && /[?&]relay=force(&|$)/.test(window.location.search || '');
+    if (relayForced) {
+      // Test mode: no WebRTC at all, every packet through the relay, so the relay path can be proven
+      // from home before it is trusted on a campus network.
+      log('relay forced by ?relay=force: skipping WebRTC, relay', relayUrl);
+      selfIdCached = trystero.selfId;
+      startLiveness();
+      connectRelay();
+      startPing();
+      log('self id:', selfIdCached);
+      emit('OnNetReady', selfIdCached);
+      return;
+    }
+
     var joined;
     try {
       joined = trystero.joinRoom(
@@ -796,7 +923,9 @@
             var msg = 'join failed: ' + (details && details.error) + ' | ' + why;
             if (msg.length > 520) msg = msg.slice(0, 517) + '...';
             showLogButton();
-            emit('OnNetError', msg);
+            // With the relay up the room still works through it: a WebRTC join error is then a note, not an error.
+            if (relayOpen) log('join error ignored, the relay is up:', msg);
+            else emit('OnNetError', msg);
           },
           // the library allows 10 s for its hello after a connection opens; a shared radio needs longer
           handshakeTimeoutMs: 30000
@@ -858,6 +987,7 @@
     startDiagnostics();
     startRelayRefresh();
     startPing();
+    connectRelay();   // beside WebRTC, for the peers WebRTC cannot reach; a no-op without a relay URL
     log('self id:', selfIdCached);
     emit('OnNetReady', selfIdCached);
   }
@@ -868,6 +998,7 @@
     stopRelayRefresh();
     stopPing();
     stopLiveness();
+    disconnectRelay();
     // the mic and its VAD survive a leave (the mode is a persisted
     // setting); only the per-peer playback elements go
     Object.keys(peerAudio).forEach(removePeerAudio);
@@ -882,26 +1013,50 @@
   }
 
   function broadcast(payloadB64) {
-    if (!sendAction) return;
+    if (!sendAction && !relayOpen) return;
     stats.tx++;
-    try {
-      sendAction(b64ToBytes(payloadB64)).catch(function (e) {
-        console.error(TAG, 'broadcast failed:', e);
+    var bytes = b64ToBytes(payloadB64);
+    if (sendAction) {
+      try {
+        sendAction(bytes).catch(function (e) {
+          console.error(TAG, 'broadcast failed:', e);
+        });
+      } catch (e) {
+        console.error(TAG, 'broadcast threw:', e);
+      }
+    }
+    // The relay carries it to the peers WebRTC does not reach, each once: never to a peer on both paths.
+    if (relayOpen) {
+      Object.keys(relayPeers).forEach(function (id) {
+        if (!rtcConnected(id)) relaySend(id, bytes);
       });
-    } catch (e) {
-      console.error(TAG, 'broadcast threw:', e);
     }
   }
 
   function sendTo(peerId, payloadB64) {
-    if (!sendAction) return;
+    if (!sendAction && !relayOpen) return;
     stats.tx++;
-    try {
-      sendAction(b64ToBytes(payloadB64), { target: peerId }).catch(function (e) {
-        console.error(TAG, 'sendTo failed:', e);
-      });
-    } catch (e) {
-      console.error(TAG, 'sendTo threw:', e);
+    var bytes = b64ToBytes(payloadB64);
+    if (sendAction && rtcConnected(peerId)) {
+      try {
+        sendAction(bytes, { target: peerId }).catch(function (e) {
+          console.error(TAG, 'sendTo failed:', e);
+        });
+      } catch (e) {
+        console.error(TAG, 'sendTo threw:', e);
+      }
+      return;
+    }
+    if (relaySend(peerId, bytes)) return;
+    // Not on the relay either: let WebRTC try (a peer still mid-handshake).
+    if (sendAction) {
+      try {
+        sendAction(bytes, { target: peerId }).catch(function (e) {
+          console.error(TAG, 'sendTo failed:', e);
+        });
+      } catch (e) {
+        console.error(TAG, 'sendTo threw:', e);
+      }
     }
   }
 
@@ -912,6 +1067,7 @@
   function getPeerIds() {
     var ids = [];
     try { if (room) ids = Object.keys(room.getPeers()); } catch (e) {}
+    Object.keys(relayPeers).forEach(function (id) { if (ids.indexOf(id) < 0) ids.push(id); });
     return JSON.stringify(ids);
   }
 
