@@ -445,9 +445,11 @@
       if (relaySocket !== ws) return;
       relaySocket = null;
       relayOpen = false;
-      var gone = Object.keys(relayPeers);
+      // The peers stay known: the socket reopens in a few seconds (scheduleRelayRetry) with the same peer id and
+      // the hello lists them again. Forgetting them here raised OnPeerLeft for every relay peer on a blip, which
+      // on the host released their slots and dropped their queued events, and on a client ended the session as
+      // 'host left'. A peer that is really gone falls silent and the liveness timeout (15 s) says so.
       relayPeers = {};
-      gone.forEach(function (id) { if (!rtcConnected(id)) markPeerGone(id, 'relay closed'); });
       log('relay: closed', ev && ev.code, ev && ev.reason);
       scheduleRelayRetry();
     };
@@ -975,6 +977,9 @@
     room.onPeerLeave = function (peerId) {
       log('peer left:', peerId);
       removePeerAudio(peerId);
+      // A WebRTC connection that came up and died again is not the peer leaving while the relay still carries
+      // it (the relay's own 'leave' makes the same check the other way round).
+      if (relayPeers[peerId]) { log('peer left webrtc, still on the relay:', peerId); return; }
       markPeerGone(peerId, 'trystero leave');
     };
     room.onPeerStream = function (stream, peerId) {

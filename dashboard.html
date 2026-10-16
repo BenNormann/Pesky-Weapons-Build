@@ -1,0 +1,556 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pesky Weapons Analytics</title>
+  <!--
+    The playtest dashboard (docs/ANALYTICS.md section 8). Ships with every WebGL build beside index.html and
+    reads the team Sheet through the Apps Script's GET ?format=json (tools/analytics/Code.gs). No libraries:
+    the charts are plain SVG. ?src=<url> reads another JSON source (a local file, for testing).
+  -->
+  <style>
+    :root {
+      color-scheme: light;
+      --page: #f9f9f7;
+      --surface: #fcfcfb;
+      --ink: #0b0b0b;
+      --ink-2: #52514e;
+      --muted: #898781;
+      --grid: #e1e0d9;
+      --axis: #c3c2b7;
+      --ring: rgba(11, 11, 11, 0.10);
+      --s1: #2a78d6;
+      --s2: #eb6834;
+      --s3: #1baf7a;
+      --s4: #eda100;
+      --critical: #d03b3b;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:where(:not([data-theme="light"])) {
+        color-scheme: dark;
+        --page: #0d0d0d;
+        --surface: #1a1a19;
+        --ink: #f0efec;
+        --ink-2: #c3c2b7;
+        --muted: #898781;
+        --grid: #2c2c2a;
+        --axis: #383835;
+        --ring: rgba(255, 255, 255, 0.10);
+        --s1: #3987e5;
+        --s2: #d95926;
+        --s3: #199e70;
+        --s4: #c98500;
+      }
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface: #1a1a19;
+      --ink: #f0efec;
+      --ink-2: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --ring: rgba(255, 255, 255, 0.10);
+      --s1: #3987e5;
+      --s2: #d95926;
+      --s3: #199e70;
+      --s4: #c98500;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+    header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 16px; }
+    h1 { font-size: 22px; margin: 0; letter-spacing: -0.01em; }
+    h2 { font-size: 15px; margin: 0 0 2px; }
+    .sub { color: var(--ink-2); margin: 0; }
+    .note { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+
+    .filters { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin: 20px 0 16px; }
+    .filters label { display: inline-flex; align-items: center; gap: 8px; color: var(--ink-2); }
+    select, button {
+      font: inherit; color: var(--ink); background: var(--surface);
+      border: 1px solid var(--axis); border-radius: 6px; padding: 5px 10px;
+    }
+    button { cursor: pointer; }
+    button:hover, select:hover { border-color: var(--muted); }
+
+    .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 12px; }
+    .tile, .card { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 14px 16px; }
+    .tile .label { color: var(--ink-2); font-size: 13px; }
+    .tile .value { font-size: 30px; font-weight: 600; line-height: 1.2; margin: 4px 0 2px; }
+    .tile .n { color: var(--muted); font-size: 12px; }
+
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); gap: 12px; }
+    .chart { position: relative; width: 100%; }
+    .chart svg { display: block; width: 100%; overflow: visible; }
+    .chart text { font: 11px system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--muted); }
+    .chart text.value { fill: var(--ink-2); }
+    .chart text.inbar { fill: #ffffff; font-weight: 600; }
+    .chart .hit { fill: transparent; cursor: default; }
+    .chart .hit:hover { fill: var(--ink); fill-opacity: 0.04; }
+    .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 6px 0 4px; color: var(--ink-2); font-size: 12px; }
+    .legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+    .tip {
+      position: fixed; pointer-events: none; z-index: 10; display: none;
+      background: var(--surface); color: var(--ink); border: 1px solid var(--ring);
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12); border-radius: 8px; padding: 8px 10px; font-size: 12px;
+      max-width: 260px;
+    }
+    .tip b { display: block; margin-bottom: 2px; }
+
+    .status { margin: 12px 0; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--ring); background: var(--surface); }
+    .status.error { border-color: var(--critical); }
+    .status.error::before { content: "⚠ "; color: var(--critical); }
+
+    details { margin-top: 12px; }
+    summary { cursor: pointer; color: var(--ink-2); padding: 6px 0; }
+    .table-wrap { overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; font-size: 12px; background: var(--surface); }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+    th { color: var(--ink-2); font-weight: 600; }
+    td.num { font-variant-numeric: tabular-nums; text-align: right; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Pesky Weapons playtest analytics</h1>
+      <p class="sub">Runs that started with 3 or more players, as recorded by the host's game.</p>
+    </div>
+    <div>
+      <span class="note" id="updated"></span>
+      <button id="refresh" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <div class="filters">
+    <label>Build <select id="build" autocomplete="off"><option value="">All builds</option></select></label>
+    <label><input type="checkbox" id="abandoned" autocomplete="off"> Include runs the host left mid-way</label>
+  </div>
+
+  <div id="status" class="status" hidden></div>
+
+  <section class="tiles" aria-label="Headline numbers">
+    <div class="tile"><div class="label">Runs recorded</div><div class="value" id="t-runs">–</div><div class="n" id="t-runs-n"></div></div>
+    <div class="tile"><div class="label">Crew escaped</div><div class="value" id="t-escape">–</div><div class="n" id="t-escape-n"></div></div>
+    <div class="tile"><div class="label">Typical run length</div><div class="value" id="t-length">–</div><div class="n" id="t-length-n"></div></div>
+    <div class="tile"><div class="label">Runs where the Mage was caught</div><div class="value" id="t-caught">–</div><div class="n" id="t-caught-n"></div></div>
+    <div class="tile"><div class="label">Votes that hit the Mage</div><div class="value" id="t-hit">–</div><div class="n" id="t-hit-n"></div></div>
+  </section>
+
+  <section class="grid">
+    <div class="card">
+      <h2>Where runs stall: time in each room</h2>
+      <p class="note">Average seconds from the first player entering a room to the first entering the next one. Cleared rooms only.</p>
+      <div class="chart" id="c-room-time"></div>
+    </div>
+    <div class="card">
+      <h2>Where runs stall: runs that ended in each room</h2>
+      <p class="note">How many runs ended (time ran out, the Mage won, the host left) with the crew still in that room. The Exit room counts runs that got there but did not all escape.</p>
+      <div class="chart" id="c-room-end"></div>
+    </div>
+    <div class="card">
+      <h2>How runs end, by player count</h2>
+      <div class="legend" id="l-outcome"></div>
+      <div class="chart" id="c-outcome"></div>
+    </div>
+    <div class="card">
+      <h2>Vote accuracy: who the votes banished</h2>
+      <p class="note">Every finished vote. "Mage" means the crew found the traitor.</p>
+      <div class="chart" id="c-votes"></div>
+    </div>
+    <div class="card">
+      <h2>When votes happen</h2>
+      <p class="note">Minute of the run each vote ended in.</p>
+      <div class="chart" id="c-vote-time"></div>
+    </div>
+  </section>
+
+  <details>
+    <summary>Runs table</summary>
+    <div class="table-wrap" id="runs-table"></div>
+  </details>
+</main>
+<div class="tip" id="tip" role="tooltip"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  // The team Sheet's Apps Script (docs/ANALYTICS.md). ?src= overrides it, e.g. a local JSON file for testing.
+  var SHEET_JSON = 'https://script.google.com/macros/s/AKfycbzboCic654g4sF2RMXHVw96riQGhrIO0CUvj85wY3SNDJTUKPpcVT_IlQNA-6pfibhI/exec?format=json';
+  var REFRESH_MS = 60000;
+
+  // Outcomes in a fixed order, each with its own colour slot: a filter never repaints them.
+  var OUTCOMES = [
+    { key: 'Escaped', label: 'Crew escaped', color: 'var(--s1)' },
+    { key: 'TimedOut', label: 'Time ran out', color: 'var(--s2)' },
+    { key: 'WeaponsGone', label: 'Crew voted out', color: 'var(--s3)' },
+    { key: 'Resurrected', label: 'Mage resurrected', color: 'var(--s4)' }
+  ];
+  var BANISHED = [
+    { key: 'mage', label: 'Mage' },
+    { key: 'weapon', label: 'A weapon' },
+    { key: 'nobody', label: 'Nobody' }
+  ];
+
+  var data = { runs: [], rooms: [], votes: [] };
+  var $ = function (id) { return document.getElementById(id); };
+
+  function src() {
+    var m = /[?&]src=([^&]+)/.exec(location.search);
+    return m ? decodeURIComponent(m[1]) : SHEET_JSON;
+  }
+
+  // Sheets hands back TRUE/FALSE as booleans, but a hand-edited cell may be text.
+  function bool(v) { return v === true || String(v).toUpperCase() === 'TRUE'; }
+  function num(v) { var n = Number(v); return isFinite(n) ? n : 0; }
+
+  function load() {
+    $('refresh').disabled = true;
+    fetch(src(), { cache: 'no-store' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function (json) {
+        data = {
+          runs: (json.runs || []).filter(function (r) { return r.run_id; }),
+          rooms: json.rooms || [],
+          votes: json.votes || []
+        };
+        status('');
+        $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' · ';
+        fillBuilds();
+        render();
+      })
+      .catch(function (e) {
+        status('Could not load the Sheet (' + e.message + '). Brave Shields and some ad blockers block script.google.com: '
+          + 'turn them off for this page. If the Apps Script was just changed, it needs a new version of its deployment.', true);
+      })
+      .then(function () { $('refresh').disabled = false; });
+  }
+
+  function status(text, error) {
+    var el = $('status');
+    el.hidden = !text;
+    el.textContent = text;
+    el.className = 'status' + (error ? ' error' : '');
+  }
+
+  function fillBuilds() {
+    var sel = $('build');
+    var keep = sel.value;
+    var builds = {};
+    data.runs.forEach(function (r) { builds[String(r.build)] = true; });
+    sel.length = 1;
+    Object.keys(builds).sort().forEach(function (b) {
+      var o = document.createElement('option');
+      o.value = b;
+      o.textContent = b;
+      sel.appendChild(o);
+    });
+    sel.value = builds[keep] ? keep : '';
+  }
+
+  // ---------------------------------------------------------------- the numbers
+
+  function render() {
+    var build = $('build').value;
+    var withAbandoned = $('abandoned').checked;
+    var runs = data.runs.filter(function (r) {
+      return (!build || String(r.build) === build) && (withAbandoned || r.ended === 'result');
+    });
+    var ids = {};
+    runs.forEach(function (r) { ids[r.run_id] = r; });
+    var rooms = data.rooms.filter(function (r) { return ids[r.run_id]; });
+    var votes = data.votes.filter(function (v) { return ids[v.run_id]; });
+    var finished = runs.filter(function (r) { return r.ended === 'result'; });
+
+    tiles(runs, finished, votes);
+    roomCharts(rooms, runs);
+    outcomeChart(finished);
+    voteCharts(votes);
+    table(runs);
+  }
+
+  function pct(a, b) { return b ? Math.round(100 * a / b) + '%' : '–'; }
+  function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
+  function clock(s) {
+    s = Math.round(s);
+    return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+  }
+  function median(xs) {
+    if (!xs.length) return 0;
+    var s = xs.slice().sort(function (a, b) { return a - b; });
+    var m = Math.floor(s.length / 2);
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  }
+
+  function tiles(runs, finished, votes) {
+    var abandoned = runs.length - finished.length;
+    $('t-runs').textContent = runs.length;
+    $('t-runs-n').textContent = plural(finished.length, 'finished run') + (abandoned ? ', ' + abandoned + ' left mid-way' : '');
+
+    var escaped = finished.filter(function (r) { return r.outcome === 'Escaped'; }).length;
+    $('t-escape').textContent = pct(escaped, finished.length);
+    $('t-escape-n').textContent = escaped + ' of ' + plural(finished.length, 'finished run');
+
+    var lengths = finished.map(function (r) { return num(r.duration_s); });
+    $('t-length').textContent = lengths.length ? clock(median(lengths)) : '–';
+    $('t-length-n').textContent = lengths.length ? 'median of ' + plural(lengths.length, 'finished run') : 'no finished runs';
+
+    var voted = runs.filter(function (r) { return num(r.votes_called) > 0; });
+    var caught = voted.filter(function (r) { return bool(r.mage_banished); }).length;
+    $('t-caught').textContent = pct(caught, voted.length);
+    $('t-caught-n').textContent = caught + ' of ' + plural(voted.length, 'run') + ' that held a vote';
+
+    // Per vote, not per run: a run can hold several votes and the Mage is caught at most once.
+    var hits = votes.filter(function (v) { return v.banished === 'mage'; }).length;
+    $('t-hit').textContent = pct(hits, votes.length);
+    $('t-hit-n').textContent = hits + ' of ' + plural(votes.length, 'vote');
+  }
+
+  // Rooms are grouped by name, in run order (their typical position in the run).
+  function roomGroups(rooms) {
+    var by = {};
+    rooms.forEach(function (r) {
+      var name = String(r.room || ('Room ' + r.room_id));
+      var g = by[name] || (by[name] = { name: name, at: 0, rows: 0, cleared: [], stuck: 0 });
+      g.rows++;
+      g.at += num(r.index);
+      if (bool(r.cleared)) g.cleared.push(num(r.seconds));
+      else g.stuck++;
+    });
+    return Object.keys(by).map(function (k) { return by[k]; })
+      .sort(function (a, b) { return a.at / a.rows - b.at / b.rows; });
+  }
+
+  function roomCharts(rooms, runs) {
+    var groups = roomGroups(rooms);
+    bars($('c-room-time'), groups.filter(function (g) { return g.cleared.length; }).map(function (g) {
+      var avg = g.cleared.reduce(function (a, b) { return a + b; }, 0) / g.cleared.length;
+      return { label: g.name, value: avg, text: clock(avg),
+        tip: '<b>' + esc(g.name) + '</b>' + clock(avg) + ' on average<br>' + plural(g.cleared.length, 'run') + ' cleared it' };
+    }), { format: clock, empty: 'No room has been cleared yet.' });
+    var ended = groups.map(function (g) {
+      return { label: g.name, value: g.stuck, text: String(g.stuck),
+        tip: '<b>' + esc(g.name) + '</b>' + plural(g.stuck, 'run') + ' ended here<br>out of ' + plural(g.rows, 'run') + ' that reached it' };
+    });
+    // The Exit room has no rooms row: a run that got there and still did not escape (the crew never all stood
+    // in it at once before the time ran out) stalled there.
+    var atExit = runs.filter(function (r) { return num(r.rooms_reached) > num(r.rooms_total); });
+    if (atExit.length) {
+      var stuck = atExit.filter(function (r) { return r.outcome !== 'Escaped'; }).length;
+      ended.push({ label: 'Exit room', value: stuck, text: String(stuck),
+        tip: '<b>Exit room</b>' + plural(stuck, 'run') + ' reached it and did not escape<br>out of ' + plural(atExit.length, 'run') + ' that reached it' });
+    }
+    bars($('c-room-end'), ended, { format: function (v) { return String(Math.round(v)); }, integer: true, empty: 'No rooms recorded yet.' });
+  }
+
+  function outcomeChart(finished) {
+    // Only the outcomes that happened get a legend entry; each keeps its own fixed colour either way.
+    var seen = {};
+    finished.forEach(function (r) { seen[r.outcome] = true; });
+    var legend = $('l-outcome');
+    legend.innerHTML = OUTCOMES.filter(function (o) { return seen[o.key]; }).map(function (o) {
+      return '<span><i style="background:' + o.color + '"></i>' + o.label + '</span>';
+    }).join('');
+    var by = {};
+    finished.forEach(function (r) {
+      var p = num(r.players_start);
+      var g = by[p] || (by[p] = { total: 0 });
+      g[r.outcome] = (g[r.outcome] || 0) + 1;
+      g.total++;
+    });
+    var cats = Object.keys(by).map(Number).sort(function (a, b) { return a - b; }).map(function (p) {
+      var g = by[p];
+      return {
+        label: p + ' players',
+        segments: OUTCOMES.map(function (o) { return { value: g[o.key] || 0, color: o.color, label: o.label }; }),
+        tip: '<b>' + p + ' players</b>' + OUTCOMES.filter(function (o) { return g[o.key]; }).map(function (o) {
+          return o.label + ': ' + g[o.key] + ' (' + pct(g[o.key], g.total) + ')';
+        }).join('<br>')
+      };
+    });
+    stacked($('c-outcome'), cats, 'No finished runs yet.');
+  }
+
+  function voteCharts(votes) {
+    var counts = {};
+    votes.forEach(function (v) { counts[v.banished] = (counts[v.banished] || 0) + 1; });
+    bars($('c-votes'), votes.length ? BANISHED.map(function (b) {
+      var n = counts[b.key] || 0;
+      return { label: b.label, value: n, text: n + ' (' + pct(n, votes.length) + ')',
+        tip: '<b>' + b.label + '</b>' + plural(n, 'vote') + ', ' + pct(n, votes.length) + ' of ' + votes.length };
+    }) : [], { format: function (v) { return String(Math.round(v)); }, integer: true, empty: 'No votes yet.' });
+
+    var minutes = {};
+    var last = 0;
+    votes.forEach(function (v) {
+      var m = Math.floor(num(v.at_s) / 60);
+      minutes[m] = (minutes[m] || 0) + 1;
+      if (m > last) last = m;
+    });
+    var cats = [];
+    for (var m = 0; votes.length && m <= last; m++) {
+      var n = minutes[m] || 0;
+      cats.push({ label: m + '–' + (m + 1), value: n, text: n ? String(n) : '',
+        tip: '<b>Minute ' + m + '–' + (m + 1) + '</b>' + plural(n, 'vote') });
+    }
+    bars($('c-vote-time'), cats, { format: function (v) { return String(Math.round(v)); }, integer: true, empty: 'No votes yet.' });
+  }
+
+  function table(runs) {
+    var cols = ['run_id', 'received_at', 'build', 'players_start', 'players_end', 'outcome', 'ended',
+      'duration_s', 'rooms_reached', 'rooms_total', 'votes_called', 'mage_banished'];
+    var numeric = { players_start: 1, players_end: 1, duration_s: 1, rooms_reached: 1, rooms_total: 1, votes_called: 1 };
+    var html = '<table><thead><tr>' + cols.map(function (c) { return '<th>' + c + '</th>'; }).join('') + '</tr></thead><tbody>';
+    runs.slice().reverse().forEach(function (r) {
+      html += '<tr>' + cols.map(function (c) {
+        return '<td' + (numeric[c] ? ' class="num"' : '') + '>' + esc(r[c] === undefined ? '' : String(r[c])) + '</td>';
+      }).join('') + '</tr>';
+    });
+    $('runs-table').innerHTML = html + '</tbody></table>' + (runs.length ? '' : '<p class="empty">No runs.</p>');
+  }
+
+  // ---------------------------------------------------------------- the charts (plain SVG)
+
+  var SVG = 'http://www.w3.org/2000/svg';
+  var H = 220, TOP = 18, BOTTOM = 34, LEFT = 40, BAR = 24;
+
+  function el(name, attrs, parent) {
+    var e = document.createElementNS(SVG, name);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; });
+  }
+
+  // A tidy axis maximum and four steps under it.
+  function niceMax(v, integer) {
+    if (v <= 0) return integer ? 4 : 1;
+    var step = Math.pow(10, Math.floor(Math.log10(v / 4)));
+    var choices = [1, 2, 2.5, 5, 10];
+    for (var i = 0; i < choices.length; i++) {
+      var s = choices[i] * step;
+      if (integer && s < 1) continue;
+      if (s * 4 >= v) return s * 4;
+    }
+    return Math.ceil(v);
+  }
+
+  // A column: square at the baseline, 4px rounded at its data end.
+  function column(x, y, w, h) {
+    var r = Math.min(4, h, w / 2);
+    return 'M' + x + ',' + (y + h) + 'V' + (y + r) + 'Q' + x + ',' + y + ' ' + (x + r) + ',' + y
+      + 'H' + (x + w - r) + 'Q' + (x + w) + ',' + y + ' ' + (x + w) + ',' + (y + r) + 'V' + (y + h) + 'Z';
+  }
+
+  function frame(host, cats, max, format) {
+    host.innerHTML = '';
+    var W = Math.max(280, host.clientWidth);
+    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, height: H, role: 'img' }, host);
+    var plotW = W - LEFT - 8, plotH = H - TOP - BOTTOM;
+    for (var i = 0; i <= 4; i++) {
+      var y = TOP + plotH - plotH * i / 4;
+      el('line', { x1: LEFT, x2: W - 8, y1: y, y2: y, stroke: i ? 'var(--grid)' : 'var(--axis)', 'stroke-width': 1 }, svg);
+      el('text', { x: LEFT - 6, y: y + 4, 'text-anchor': 'end' }, svg).textContent = format(max * i / 4);
+    }
+    var band = plotW / cats.length;
+    // Every column keeps its label, shortened with an ellipsis to fit; labels are skipped only when the
+    // columns are too narrow for even a few characters (a long run of minutes).
+    var every = band >= 36 ? 1 : Math.ceil(36 / band);
+    cats.forEach(function (c, i) {
+      if (i % every) return;
+      var label = el('text', { x: LEFT + band * (i + 0.5), y: H - BOTTOM + 16, 'text-anchor': 'middle' }, svg);
+      var max = Math.floor(band * every / 6.5);
+      label.textContent = c.label.length > max ? c.label.slice(0, Math.max(3, max - 1)) + '…' : c.label;
+    });
+    return { svg: svg, band: band, plotH: plotH, bar: Math.min(BAR, band * 0.6) };
+  }
+
+  function hit(svg, x, w, tip) {
+    var r = el('rect', { class: 'hit', x: x, y: TOP, width: w, height: H - TOP - BOTTOM }, svg);
+    r.addEventListener('mousemove', function (e) { showTip(e, tip); });
+    r.addEventListener('mouseleave', hideTip);
+  }
+
+  function bars(host, cats, opt) {
+    if (!cats.length) { host.innerHTML = '<p class="empty">' + opt.empty + '</p>'; return; }
+    var max = niceMax(Math.max.apply(null, cats.map(function (c) { return c.value; })), opt.integer);
+    var f = frame(host, cats, max, opt.format);
+    cats.forEach(function (c, i) {
+      var h = f.plotH * c.value / max;
+      var x = LEFT + f.band * (i + 0.5) - f.bar / 2;
+      var y = TOP + f.plotH - h;
+      if (h > 0) el('path', { d: column(x, y, f.bar, h), fill: 'var(--s1)' }, f.svg);
+      if (c.text) el('text', { class: 'value', x: x + f.bar / 2, y: y - 5, 'text-anchor': 'middle' }, f.svg).textContent = c.text;
+      hit(f.svg, LEFT + f.band * i, f.band, c.tip);
+    });
+  }
+
+  function stacked(host, cats, empty) {
+    if (!cats.length) { host.innerHTML = '<p class="empty">' + empty + '</p>'; return; }
+    var totals = cats.map(function (c) { return c.segments.reduce(function (a, s) { return a + s.value; }, 0); });
+    var max = niceMax(Math.max.apply(null, totals), true);
+    var f = frame(host, cats, max, function (v) { return String(Math.round(v)); });
+    var GAP = 2;
+    cats.forEach(function (c, i) {
+      var x = LEFT + f.band * (i + 0.5) - f.bar / 2;
+      var base = TOP + f.plotH;
+      var shown = c.segments.filter(function (s) { return s.value > 0; });
+      shown.forEach(function (s, k) {
+        var h = f.plotH * s.value / max;
+        var top = k === shown.length - 1;
+        var y = base - h;
+        var drawH = Math.max(1, h - (k ? GAP : 0));
+        el('path', { d: top ? column(x, y, f.bar, drawH) : 'M' + x + ',' + y + 'h' + f.bar + 'v' + drawH + 'h' + -f.bar + 'Z', fill: s.color }, f.svg);
+        if (h >= 16) el('text', { class: 'inbar', x: x + f.bar / 2, y: y + drawH / 2 + 4, 'text-anchor': 'middle' }, f.svg).textContent = s.value;
+        base = y;
+      });
+      el('text', { class: 'value', x: x + f.bar / 2, y: base - 5, 'text-anchor': 'middle' }, f.svg).textContent = totals[i];
+      hit(f.svg, LEFT + f.band * i, f.band, c.tip);
+    });
+  }
+
+  function showTip(e, html) {
+    var t = $('tip');
+    t.innerHTML = html;
+    t.style.display = 'block';
+    var x = e.clientX + 14, y = e.clientY + 14;
+    if (x + t.offsetWidth > innerWidth - 8) x = e.clientX - t.offsetWidth - 14;
+    if (y + t.offsetHeight > innerHeight - 8) y = e.clientY - t.offsetHeight - 14;
+    t.style.left = x + 'px';
+    t.style.top = y + 'px';
+  }
+
+  function hideTip() { $('tip').style.display = 'none'; }
+
+  $('refresh').addEventListener('click', load);
+  $('build').addEventListener('change', render);
+  $('abandoned').addEventListener('change', render);
+  var resizeTimer;
+  addEventListener('resize', function () { clearTimeout(resizeTimer); resizeTimer = setTimeout(render, 150); });
+  setInterval(function () { if (!document.hidden) load(); }, REFRESH_MS);
+  load();
+})();
+</script>
+</body>
+</html>
