@@ -101,6 +101,8 @@
     .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 6px 0 4px; color: var(--ink-2); font-size: 12px; }
     .legend span { display: inline-flex; align-items: center; gap: 6px; }
     .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+    .section-head { margin: 36px 0 4px; font-size: 18px; }
+    .chart circle.dot { stroke: var(--surface); stroke-width: 2; }
 
     .tip {
       position: fixed; pointer-events: none; z-index: 10; display: none;
@@ -183,6 +185,38 @@
     <summary>Runs table</summary>
     <div class="table-wrap" id="runs-table"></div>
   </details>
+
+  <h2 class="section-head">Physics glitches</h2>
+  <p class="sub">Weapons that fell out of the world, went through a floor, or were shoved further in one physics step than
+    their speed explains. Logged by whichever machine runs that weapon's physics, with any number of players.</p>
+  <div class="filters">
+    <label><input type="checkbox" id="glitch-debug" autocomplete="off"> Include debug pages and the Editor</label>
+  </div>
+
+  <section class="tiles" aria-label="Glitch numbers">
+    <div class="tile"><div class="label">Glitches logged</div><div class="value" id="t-glitches">–</div><div class="n" id="t-glitches-n"></div></div>
+    <div class="tile"><div class="label">Fell out of the world</div><div class="value" id="t-fell">–</div><div class="n" id="t-fell-n"></div></div>
+  </section>
+
+  <section class="grid">
+    <div class="card">
+      <h2>Glitches by room</h2>
+      <div class="legend" id="l-glitch-room"></div>
+      <div class="chart" id="c-glitch-room"></div>
+    </div>
+    <div class="card">
+      <h2>Where in the room</h2>
+      <p class="note">Top-down, in the room's own frame: x across, z up the page (north), metres from the room's centre.
+        <label>Room <select id="glitch-room" autocomplete="off"></select></label></p>
+      <div class="legend" id="l-glitch-map"></div>
+      <div class="chart" id="c-glitch-map"></div>
+    </div>
+  </section>
+
+  <details>
+    <summary>Glitches table</summary>
+    <div class="table-wrap" id="glitch-table"></div>
+  </details>
 </main>
 <div class="tip" id="tip" role="tooltip"></div>
 
@@ -201,13 +235,19 @@
     { key: 'WeaponsGone', label: 'Crew voted out', color: 'var(--s3)' },
     { key: 'Resurrected', label: 'Mage resurrected', color: 'var(--s4)' }
   ];
+  // Glitch kinds in a fixed order, each with its own colour slot (the first three validate for a scatter).
+  var KINDS = [
+    { key: 'fell_out', label: 'Fell out of the world', color: 'var(--s1)' },
+    { key: 'below_room', label: 'Through the floor', color: 'var(--s2)' },
+    { key: 'jump', label: 'Shoved (jump)', color: 'var(--s3)' }
+  ];
   var BANISHED = [
     { key: 'mage', label: 'Mage' },
     { key: 'weapon', label: 'A weapon' },
     { key: 'nobody', label: 'Nobody' }
   ];
 
-  var data = { runs: [], rooms: [], votes: [] };
+  var data = { runs: [], rooms: [], votes: [], glitches: [] };
   var $ = function (id) { return document.getElementById(id); };
 
   function src() {
@@ -230,7 +270,8 @@
         data = {
           runs: (json.runs || []).filter(function (r) { return r.run_id; }),
           rooms: json.rooms || [],
-          votes: json.votes || []
+          votes: json.votes || [],
+          glitches: (json.glitches || []).filter(function (g) { return g.glitch_id; })
         };
         status('');
         $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' · ';
@@ -256,6 +297,7 @@
     var keep = sel.value;
     var builds = {};
     data.runs.forEach(function (r) { builds[String(r.build)] = true; });
+    data.glitches.forEach(function (g) { builds[String(g.build)] = true; });
     sel.length = 1;
     Object.keys(builds).sort().forEach(function (b) {
       var o = document.createElement('option');
@@ -285,6 +327,7 @@
     outcomeChart(finished);
     voteCharts(votes);
     table(runs);
+    glitches(build);
   }
 
   function pct(a, b) { return b ? Math.round(100 * a / b) + '%' : '–'; }
@@ -427,6 +470,108 @@
     $('runs-table').innerHTML = html + '</tbody></table>' + (runs.length ? '' : '<p class="empty">No runs.</p>');
   }
 
+  // ---------------------------------------------------------------- glitches
+
+  function glitches(build) {
+    var withDebug = $('glitch-debug').checked;
+    var list = data.glitches.filter(function (g) {
+      return (!build || String(g.build) === build) && (withDebug || !bool(g.debug));
+    });
+    var sessions = {};
+    list.forEach(function (g) { sessions[g.session] = true; });
+    $('t-glitches').textContent = list.length;
+    $('t-glitches-n').textContent = 'from ' + plural(Object.keys(sessions).length, 'session');
+    var fell = list.filter(function (g) { return g.kind === 'fell_out'; }).length;
+    $('t-fell').textContent = fell;
+    $('t-fell-n').textContent = list.length ? pct(fell, list.length) + ' of all glitches' : 'none yet';
+
+    // Only the kinds that happened get a legend entry; each keeps its fixed colour either way.
+    var seen = {};
+    list.forEach(function (g) { seen[g.kind] = true; });
+    var legend = KINDS.filter(function (k) { return seen[k.key]; }).map(function (k) {
+      return '<span><i style="background:' + k.color + '"></i>' + k.label + '</span>';
+    }).join('');
+    $('l-glitch-room').innerHTML = legend;
+
+    var byRoom = {};
+    list.forEach(function (g) {
+      var name = g.room ? String(g.room) : 'No room';
+      var r = byRoom[name] || (byRoom[name] = { total: 0 });
+      r[g.kind] = (r[g.kind] || 0) + 1;
+      r.total++;
+    });
+    var names = Object.keys(byRoom).sort(function (a, b) { return byRoom[b].total - byRoom[a].total; });
+    stacked($('c-glitch-room'), names.map(function (name) {
+      var r = byRoom[name];
+      return {
+        label: name,
+        segments: KINDS.map(function (k) { return { value: r[k.key] || 0, color: k.color, label: k.label }; }),
+        tip: '<b>' + esc(name) + '</b>' + KINDS.filter(function (k) { return r[k.key]; }).map(function (k) {
+          return k.label + ': ' + r[k.key];
+        }).join('<br>')
+      };
+    }), 'No glitches logged.');
+
+    // The room picker keeps its choice across refreshes while that room still has glitches.
+    var sel = $('glitch-room');
+    var keep = sel.value;
+    var mapped = names.filter(function (n) { return n !== 'No room'; });
+    sel.innerHTML = mapped.map(function (n) { return '<option>' + esc(n) + '</option>'; }).join('');
+    if (mapped.indexOf(keep) >= 0) sel.value = keep;
+    $('l-glitch-map').innerHTML = legend;
+    roomMap($('c-glitch-map'), list.filter(function (g) { return String(g.room) === sel.value; }));
+    glitchTable(list);
+  }
+
+  // Top-down dots in the room's own frame: x across, z up the page.
+  function roomMap(host, points) {
+    if (!points.length) { host.innerHTML = '<p class="empty">No glitches with a room.</p>'; return; }
+    host.innerHTML = '';
+    var W = Math.max(280, host.clientWidth), side = Math.min(W - LEFT - 8, 360);
+    var size = side + TOP + BOTTOM;
+    var reach = 10;
+    points.forEach(function (g) { reach = Math.max(reach, Math.abs(num(g.local_x)), Math.abs(num(g.local_z))); });
+    reach = Math.ceil(reach / 5) * 5;
+    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + size, height: size, role: 'img' }, host);
+    var x0 = LEFT + (W - LEFT - 8 - side) / 2;
+    function px(x) { return x0 + (x + reach) / (2 * reach) * side; }
+    function py(z) { return TOP + (reach - z) / (2 * reach) * side; }
+    el('rect', { x: x0, y: TOP, width: side, height: side, fill: 'none', stroke: 'var(--grid)', 'stroke-width': 1 }, svg);
+    el('line', { x1: px(0), x2: px(0), y1: TOP, y2: TOP + side, stroke: 'var(--grid)', 'stroke-width': 1 }, svg);
+    el('line', { x1: x0, x2: x0 + side, y1: py(0), y2: py(0), stroke: 'var(--grid)', 'stroke-width': 1 }, svg);
+    el('text', { x: x0 - 6, y: TOP + 4, 'text-anchor': 'end' }, svg).textContent = '+' + reach;
+    el('text', { x: x0 - 6, y: TOP + side + 4, 'text-anchor': 'end' }, svg).textContent = '−' + reach;
+    el('text', { x: x0, y: TOP + side + 16, 'text-anchor': 'start' }, svg).textContent = '−' + reach + ' m';
+    el('text', { x: x0 + side, y: TOP + side + 16, 'text-anchor': 'end' }, svg).textContent = '+' + reach + ' m';
+    el('text', { x: px(0), y: TOP - 6, 'text-anchor': 'middle' }, svg).textContent = 'north';
+    var color = {};
+    KINDS.forEach(function (k) { color[k.key] = k.color; });
+    points.forEach(function (g) {
+      var dot = el('circle', { class: 'dot', cx: px(num(g.local_x)), cy: py(num(g.local_z)), r: 5, fill: color[g.kind] || 'var(--muted)' }, svg);
+      var kind = KINDS.filter(function (k) { return k.key === g.kind; })[0];
+      var tip = '<b>' + esc(kind ? kind.label : g.kind) + '</b>' + esc(g.weapon) + ' (' + esc(g.held) + ')<br>'
+        + 'x ' + num(g.local_x).toFixed(1) + ', y ' + num(g.local_y).toFixed(1) + ', z ' + num(g.local_z).toFixed(1)
+        + (g.last_contact ? '<br>last touched ' + esc(g.last_contact) : '') + '<br>' + esc(g.at);
+      // A hit target bigger than the dot.
+      var hitDot = el('circle', { cx: px(num(g.local_x)), cy: py(num(g.local_z)), r: 10, fill: 'transparent' }, svg);
+      hitDot.addEventListener('mousemove', function (e) { showTip(e, tip); });
+      hitDot.addEventListener('mouseleave', hideTip);
+    });
+  }
+
+  function glitchTable(list) {
+    var cols = ['at', 'kind', 'weapon', 'held', 'room', 'local_x', 'local_y', 'local_z', 'x', 'y', 'z', 'speed',
+      'jump_m', 'last_contact', 'role', 'players', 'scene', 'build', 'debug'];
+    var numeric = { local_x: 1, local_y: 1, local_z: 1, x: 1, y: 1, z: 1, speed: 1, jump_m: 1, players: 1 };
+    var html = '<table><thead><tr>' + cols.map(function (c) { return '<th>' + c + '</th>'; }).join('') + '</tr></thead><tbody>';
+    list.slice().reverse().forEach(function (g) {
+      html += '<tr>' + cols.map(function (c) {
+        return '<td' + (numeric[c] ? ' class="num"' : '') + '>' + esc(g[c] === undefined ? '' : String(g[c])) + '</td>';
+      }).join('') + '</tr>';
+    });
+    $('glitch-table').innerHTML = html + '</tbody></table>' + (list.length ? '' : '<p class="empty">No glitches.</p>');
+  }
+
   // ---------------------------------------------------------------- the charts (plain SVG)
 
   var SVG = 'http://www.w3.org/2000/svg';
@@ -546,6 +691,8 @@
   $('refresh').addEventListener('click', load);
   $('build').addEventListener('change', render);
   $('abandoned').addEventListener('change', render);
+  $('glitch-debug').addEventListener('change', render);
+  $('glitch-room').addEventListener('change', render);
   var resizeTimer;
   addEventListener('resize', function () { clearTimeout(resizeTimer); resizeTimer = setTimeout(render, 150); });
   setInterval(function () { if (!document.hidden) load(); }, REFRESH_MS);
