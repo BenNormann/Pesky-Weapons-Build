@@ -849,6 +849,9 @@
   // permission granted it offers every interface with real addresses. So the join asks first, waits a
   // little for the answer, and joins either way. The stream is muted, handed to the voice path if voice
   // is on, and released shortly after the join if it is not.
+  // Round 36 (owner): no microphone prompt at join for now. The join goes straight ahead with the browser's
+  // hidden local addresses; set this back to true to ask again. The voice setting still asks on its own if turned on.
+  var ASK_MIC_AT_JOIN = false;
   var primeStream = null;
   var primeTimer = null;
   var startToken = 0;
@@ -859,7 +862,7 @@
   function primeLocalAddresses(done) {
     var finished = false;
     function go() { if (finished) return; finished = true; done(); }
-    if (micStream || primeStream || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { go(); return; }
+    if (!ASK_MIC_AT_JOIN || micStream || primeStream || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { go(); return; }
     if (micPending) {
       // the voice setting is already asking: wait for that answer instead of prompting twice
       var waited = 0;

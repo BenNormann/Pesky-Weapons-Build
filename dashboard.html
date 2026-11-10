@@ -89,6 +89,7 @@
     .tile .n { color: var(--muted); font-size: 12px; }
 
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); gap: 12px; }
+    .card.wide { grid-column: 1 / -1; }
     .chart { position: relative; width: 100%; }
     .chart svg { display: block; width: 100%; overflow: visible; }
     .chart text { font: 11px system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--muted); }
@@ -155,14 +156,25 @@
 
   <section class="grid">
     <div class="card">
-      <h2>Where runs stall: time in each room</h2>
-      <p class="note">Average seconds from the first player entering a room to the first entering the next one. Cleared rooms only.</p>
-      <div class="chart" id="c-room-time"></div>
+      <h2>Which room stops crews: reached vs cleared</h2>
+      <p class="note">Of the runs that reached each room, how many got through it (the percentage). The Exit room is cleared
+        when the whole crew escaped. A low rate marks the room to look at first: its puzzle or its hints.</p>
+      <div class="legend" id="l-funnel"></div>
+      <div class="chart" id="c-funnel"></div>
     </div>
     <div class="card">
-      <h2>Where runs stall: runs that ended in each room</h2>
-      <p class="note">How many runs ended (time ran out, the Mage won, the host left) with the crew still in that room. The Exit room counts runs that got there but did not all escape.</p>
-      <div class="chart" id="c-room-end"></div>
+      <h2>Time to clear each room</h2>
+      <p class="note">From the first player entering a room to the first entering the next, one dot per run that cleared it.
+        The box holds the middle half of those runs, the line is the median. A lone dot far above the box is one stuck
+        run, not a slow room.</p>
+      <div class="chart" id="c-room-time"></div>
+    </div>
+    <div class="card wide">
+      <h2>How far runs get, and how they end</h2>
+      <p class="note">Every run, left to right. The grey line is the runs still going; a band that drops off is the runs
+        that stopped there, coloured by how they ended.</p>
+      <div class="legend" id="l-flow"></div>
+      <div class="chart" id="c-flow"></div>
     </div>
     <div class="card">
       <h2>How runs end, by player count</h2>
@@ -170,8 +182,10 @@
       <div class="chart" id="c-outcome"></div>
     </div>
     <div class="card">
-      <h2>Vote accuracy: who the votes banished</h2>
-      <p class="note">Every finished vote. "Mage" means the crew found the traitor.</p>
+      <h2>Vote accuracy, meeting by meeting</h2>
+      <p class="note">The first meeting of each run, the second, and so on. Mage: the crew found the traitor. A weapon: they
+        banished an innocent. Nobody: the vote banished no one. Hits that only come late mean the Mage is hard to read.</p>
+      <div class="legend" id="l-votes"></div>
       <div class="chart" id="c-votes"></div>
     </div>
     <div class="card">
@@ -242,10 +256,23 @@
     { key: 'jump', label: 'Shoved (jump)', color: 'var(--s3)' }
   ];
   var BANISHED = [
-    { key: 'mage', label: 'Mage' },
-    { key: 'weapon', label: 'A weapon' },
-    { key: 'nobody', label: 'Nobody' }
+    { key: 'mage', label: 'Mage', color: 'var(--s1)' },
+    { key: 'weapon', label: 'A weapon', color: 'var(--s2)' },
+    { key: 'nobody', label: 'Nobody', color: 'var(--muted)' }
   ];
+  // A run the host left mid-way has no outcome; it is drawn only with "Include runs the host left mid-way" on.
+  var ABANDONED = { key: 'abandoned', label: 'Host left mid-way', color: 'var(--muted)' };
+  // The run's rooms in run order, by room id: a fixed axis, whatever the data holds. The names are the installed
+  // rooms' (RoomsV3Builder.DisplayNames); older rows carry other labels for the same ids, so rows are matched by id.
+  var ROOMS = [
+    { id: 3, name: 'Hold the Door' },
+    { id: 4, name: 'Cut the Rope' },
+    { id: 5, name: 'Fetch' },
+    { id: 6, name: 'Short Circuit' },
+    { id: 7, name: 'Home Run' }
+  ];
+  // Meetings of a run in order; the third and any later ones share a column.
+  var MEETINGS = ['1st', '2nd', '3rd+'];
 
   var data = { runs: [], rooms: [], votes: [], glitches: [] };
   var $ = function (id) { return document.getElementById(id); };
@@ -258,6 +285,18 @@
   // Sheets hands back TRUE/FALSE as booleans, but a hand-edited cell may be text.
   function bool(v) { return v === true || String(v).toUpperCase() === 'TRUE'; }
   function num(v) { var n = Number(v); return isFinite(n) ? n : 0; }
+
+  // A room's name by its id; a room not in ROOMS keeps the label its row carried.
+  function roomName(id, fallback) {
+    for (var i = 0; i < ROOMS.length; i++) if (ROOMS[i].id === num(id)) return ROOMS[i].name;
+    return fallback ? String(fallback) : 'Room ' + id;
+  }
+
+  function legend(id, items) {
+    $(id).innerHTML = items.map(function (o) {
+      return '<span><i style="background:' + o.color + '"></i>' + o.label + '</span>';
+    }).join('');
+  }
 
   function load() {
     $('refresh').disabled = true;
@@ -324,6 +363,7 @@
 
     tiles(runs, finished, votes);
     roomCharts(rooms, runs);
+    flowChart(runs);
     outcomeChart(finished);
     voteCharts(votes);
     table(runs);
@@ -367,41 +407,70 @@
     $('t-hit-n').textContent = hits + ' of ' + plural(votes.length, 'vote');
   }
 
-  // Rooms are grouped by name, in run order (their typical position in the run).
+  // One entry per room of ROOMS, in run order, matched by room id: how many runs reached it, how many cleared
+  // it, and the seconds each clearing took.
   function roomGroups(rooms) {
-    var by = {};
-    rooms.forEach(function (r) {
-      var name = String(r.room || ('Room ' + r.room_id));
-      var g = by[name] || (by[name] = { name: name, at: 0, rows: 0, cleared: [], stuck: 0 });
-      g.rows++;
-      g.at += num(r.index);
-      if (bool(r.cleared)) g.cleared.push(num(r.seconds));
-      else g.stuck++;
+    var groups = ROOMS.map(function (r, i) {
+      return { id: r.id, label: 'Room ' + (i + 1), name: r.name, reached: 0, cleared: [] };
     });
-    return Object.keys(by).map(function (k) { return by[k]; })
-      .sort(function (a, b) { return a.at / a.rows - b.at / b.rows; });
+    rooms.forEach(function (r) {
+      var g = groups.filter(function (x) { return x.id === num(r.room_id); })[0];
+      if (!g) return;
+      g.reached++;
+      if (bool(r.cleared)) g.cleared.push(num(r.seconds));
+    });
+    return groups;
   }
 
   function roomCharts(rooms, runs) {
     var groups = roomGroups(rooms);
-    bars($('c-room-time'), groups.filter(function (g) { return g.cleared.length; }).map(function (g) {
-      var avg = g.cleared.reduce(function (a, b) { return a + b; }, 0) / g.cleared.length;
-      return { label: g.name, value: avg, text: clock(avg),
-        tip: '<b>' + esc(g.name) + '</b>' + clock(avg) + ' on average<br>' + plural(g.cleared.length, 'run') + ' cleared it' };
-    }), { format: clock, empty: 'No room has been cleared yet.' });
-    var ended = groups.map(function (g) {
-      return { label: g.name, value: g.stuck, text: String(g.stuck),
-        tip: '<b>' + esc(g.name) + '</b>' + plural(g.stuck, 'run') + ' ended here<br>out of ' + plural(g.rows, 'run') + ' that reached it' };
-    });
-    // The Exit room has no rooms row: a run that got there and still did not escape (the crew never all stood
-    // in it at once before the time ran out) stalled there.
+    // The Exit room has no rooms row: a run reached it when rooms_reached passed rooms_total, and cleared it
+    // when the whole crew escaped.
     var atExit = runs.filter(function (r) { return num(r.rooms_reached) > num(r.rooms_total); });
-    if (atExit.length) {
-      var stuck = atExit.filter(function (r) { return r.outcome !== 'Escaped'; }).length;
-      ended.push({ label: 'Exit room', value: stuck, text: String(stuck),
-        tip: '<b>Exit room</b>' + plural(stuck, 'run') + ' reached it and did not escape<br>out of ' + plural(atExit.length, 'run') + ' that reached it' });
-    }
-    bars($('c-room-end'), ended, { format: function (v) { return String(Math.round(v)); }, integer: true, empty: 'No rooms recorded yet.' });
+    var exitCleared = atExit.filter(function (r) { return r.outcome === 'Escaped'; }).length;
+
+    var series = [
+      { label: 'Reached', color: 'var(--muted)' },
+      { label: 'Cleared', color: 'var(--s1)' }
+    ];
+    legend('l-funnel', series);
+    var cats = groups.map(function (g) {
+      return { label: g.label, sub: g.name, values: [g.reached, g.cleared.length], text: g.reached ? pct(g.cleared.length, g.reached) : '',
+        tip: '<b>' + esc(g.label + ': ' + g.name) + '</b>' + plural(g.reached, 'run') + ' reached it<br>'
+          + g.cleared.length + ' cleared it (' + pct(g.cleared.length, g.reached) + ')' };
+    });
+    cats.push({ label: 'Exit', sub: 'escape', values: [atExit.length, exitCleared], text: atExit.length ? pct(exitCleared, atExit.length) : '',
+      tip: '<b>Exit room</b>' + plural(atExit.length, 'run') + ' reached it<br>' + exitCleared + ' escaped (' + pct(exitCleared, atExit.length) + ')' });
+    grouped($('c-funnel'), runs.length ? cats : [], series, 'No runs yet.');
+
+    boxes($('c-room-time'), groups.map(function (g) {
+      var s = g.cleared.slice().sort(function (a, b) { return a - b; });
+      return { label: g.label, sub: g.name, values: s,
+        tip: '<b>' + esc(g.label + ': ' + g.name) + '</b>' + (s.length
+          ? plural(s.length, 'run') + ' cleared it<br>median ' + clock(quantile(s, 0.5)) + ', fastest ' + clock(s[0]) + ', slowest ' + clock(s[s.length - 1])
+          : 'nobody has cleared it yet') };
+    }), rooms.length ? '' : 'No rooms recorded yet.');
+  }
+
+  // Every run is at one stage when it stops: 0 Start (never entered room 1), 1..n a room, n + 1 the Exit room,
+  // n + 2 escaped. A Sankey-style flow: the line along the top is the runs still going, each drop-off band the
+  // runs that stopped at that stage, split by how they ended.
+  function flowChart(runs) {
+    var n = ROOMS.length;
+    var stages = ['Start'].concat(ROOMS.map(function (r, i) { return 'Room ' + (i + 1); }), ['Exit', 'Escaped']);
+    var names = [''].concat(ROOMS.map(function (r) { return r.name; }), ['', '']);
+    var kinds = OUTCOMES.filter(function (o) { return o.key !== 'Escaped'; }).concat([ABANDONED]);
+    var stops = stages.map(function () { return {}; });
+    var used = {};
+    runs.forEach(function (r) {
+      var at = r.outcome === 'Escaped' ? n + 2 : Math.max(0, Math.min(n + 1, num(r.rooms_reached)));
+      if (at === n + 2) { stops[at].Escaped = (stops[at].Escaped || 0) + 1; return; }
+      var key = r.ended === 'result' ? r.outcome : ABANDONED.key;
+      stops[at][key] = (stops[at][key] || 0) + 1;
+      used[key] = true;
+    });
+    legend('l-flow', (stops[n + 2].Escaped ? [OUTCOMES[0]] : []).concat(kinds.filter(function (k) { return used[k.key]; })));
+    flow($('c-flow'), stages, names, stops, kinds, runs.length);
   }
 
   function outcomeChart(finished) {
@@ -433,13 +502,23 @@
   }
 
   function voteCharts(votes) {
-    var counts = {};
-    votes.forEach(function (v) { counts[v.banished] = (counts[v.banished] || 0) + 1; });
-    bars($('c-votes'), votes.length ? BANISHED.map(function (b) {
-      var n = counts[b.key] || 0;
-      return { label: b.label, value: n, text: n + ' (' + pct(n, votes.length) + ')',
-        tip: '<b>' + b.label + '</b>' + plural(n, 'vote') + ', ' + pct(n, votes.length) + ' of ' + votes.length };
-    }) : [], { format: function (v) { return String(Math.round(v)); }, integer: true, empty: 'No votes yet.' });
+    legend('l-votes', BANISHED);
+    var by = MEETINGS.map(function () { return { total: 0 }; });
+    votes.forEach(function (v) {
+      var g = by[Math.max(0, Math.min(MEETINGS.length, num(v.n)) - 1)];
+      g[v.banished] = (g[v.banished] || 0) + 1;
+      g.total++;
+    });
+    stacked($('c-votes'), votes.length ? MEETINGS.map(function (m, i) {
+      var g = by[i];
+      return {
+        label: m + ' meeting',
+        segments: BANISHED.map(function (b) { return { value: g[b.key] || 0, color: b.color, label: b.label }; }),
+        tip: '<b>' + m + ' meeting of a run</b>' + (g.total ? BANISHED.filter(function (b) { return g[b.key]; }).map(function (b) {
+          return b.label + ': ' + g[b.key] + ' (' + pct(g[b.key], g.total) + ')';
+        }).join('<br>') : 'no run held one')
+      };
+    }) : [], 'No votes yet.');
 
     var minutes = {};
     var last = 0;
@@ -495,7 +574,7 @@
 
     var byRoom = {};
     list.forEach(function (g) {
-      var name = g.room ? String(g.room) : 'No room';
+      var name = glitchRoom(g);
       var r = byRoom[name] || (byRoom[name] = { total: 0 });
       r[g.kind] = (r[g.kind] || 0) + 1;
       r.total++;
@@ -519,8 +598,13 @@
     sel.innerHTML = mapped.map(function (n) { return '<option>' + esc(n) + '</option>'; }).join('');
     if (mapped.indexOf(keep) >= 0) sel.value = keep;
     $('l-glitch-map').innerHTML = legend;
-    roomMap($('c-glitch-map'), list.filter(function (g) { return String(g.room) === sel.value; }));
+    roomMap($('c-glitch-map'), list.filter(function (g) { return glitchRoom(g) === sel.value; }));
     glitchTable(list);
+  }
+
+  function glitchRoom(g) {
+    if (!g.room && g.room_id === '') return 'No room';
+    return g.room_id !== '' && g.room_id !== undefined ? roomName(g.room_id, g.room) : String(g.room || 'No room');
   }
 
   // Top-down dots in the room's own frame: x across, z up the page.
@@ -627,6 +711,11 @@
       var label = el('text', { x: LEFT + band * (i + 0.5), y: H - BOTTOM + 16, 'text-anchor': 'middle' }, svg);
       var max = Math.floor(band * every / 6.5);
       label.textContent = c.label.length > max ? c.label.slice(0, Math.max(3, max - 1)) + '…' : c.label;
+      // An optional second line (a room's name under its position).
+      if (c.sub) {
+        var sub = el('text', { x: LEFT + band * (i + 0.5), y: H - BOTTOM + 29, 'text-anchor': 'middle' }, svg);
+        sub.textContent = c.sub.length > max ? c.sub.slice(0, Math.max(3, max - 1)) + '…' : c.sub;
+      }
     });
     return { svg: svg, band: band, plotH: plotH, bar: Math.min(BAR, band * 0.6) };
   }
@@ -672,6 +761,138 @@
       });
       el('text', { class: 'value', x: x + f.bar / 2, y: base - 5, 'text-anchor': 'middle' }, f.svg).textContent = totals[i];
       hit(f.svg, LEFT + f.band * i, f.band, c.tip);
+    });
+  }
+
+  // Two or more columns side by side per category, one per series (e.g. reached and cleared); c.text above them.
+  function grouped(host, cats, series, empty) {
+    if (!cats.length) { host.innerHTML = '<p class="empty">' + empty + '</p>'; return; }
+    var max = niceMax(Math.max.apply(null, cats.map(function (c) { return Math.max.apply(null, c.values); })), true);
+    var f = frame(host, cats, max, function (v) { return String(Math.round(v)); });
+    var w = Math.min(BAR, f.band * 0.7 / series.length), GAP = 2;
+    cats.forEach(function (c, i) {
+      var x0 = LEFT + f.band * (i + 0.5) - (w * series.length + GAP * (series.length - 1)) / 2;
+      var top = TOP + f.plotH;
+      series.forEach(function (s, k) {
+        var h = f.plotH * c.values[k] / max;
+        var y = TOP + f.plotH - h;
+        if (h > 0) el('path', { d: column(x0 + k * (w + GAP), y, w, h), fill: s.color }, f.svg);
+        top = Math.min(top, y);
+      });
+      if (c.text) el('text', { class: 'value', x: LEFT + f.band * (i + 0.5), y: top - 5, 'text-anchor': 'middle' }, f.svg).textContent = c.text;
+      hit(f.svg, LEFT + f.band * i, f.band, c.tip);
+    });
+  }
+
+  // The q-th quantile of a sorted list, interpolated between neighbours.
+  function quantile(s, q) {
+    var p = (s.length - 1) * q, lo = Math.floor(p), hi = Math.ceil(p);
+    return s[lo] + (s[hi] - s[lo]) * (p - lo);
+  }
+
+  // Parallel box plots on a time axis, one per category (c.values sorted ascending): the box from the first to the
+  // third quartile, the median across it, whiskers to the furthest value within 1.5 box-lengths, and every value
+  // as a dot so a handful of runs is never hidden behind a box.
+  function boxes(host, cats, empty) {
+    if (empty) { host.innerHTML = '<p class="empty">' + empty + '</p>'; return; }
+    var all = [];
+    cats.forEach(function (c) { all = all.concat(c.values); });
+    var max = niceMax(all.length ? Math.max.apply(null, all) : 60, false);
+    var f = frame(host, cats, max, clock);
+    function y(v) { return TOP + f.plotH - f.plotH * v / max; }
+    cats.forEach(function (c, i) {
+      var cx = LEFT + f.band * (i + 0.5), s = c.values, w = f.bar;
+      if (!s.length) {
+        el('text', { class: 'value', x: cx, y: TOP + f.plotH - 5, 'text-anchor': 'middle' }, f.svg).textContent = 'none';
+      } else {
+        if (s.length >= 3) {
+          var q1 = quantile(s, 0.25), q3 = quantile(s, 0.75), reach = 1.5 * (q3 - q1);
+          var lo = s.filter(function (v) { return v >= q1 - reach; })[0], hi = s.filter(function (v) { return v <= q3 + reach; }).pop();
+          el('line', { x1: cx, x2: cx, y1: y(lo), y2: y(q1), stroke: 'var(--s1)', 'stroke-width': 1.5 }, f.svg);
+          el('line', { x1: cx, x2: cx, y1: y(q3), y2: y(hi), stroke: 'var(--s1)', 'stroke-width': 1.5 }, f.svg);
+          el('line', { x1: cx - w / 4, x2: cx + w / 4, y1: y(lo), y2: y(lo), stroke: 'var(--s1)', 'stroke-width': 1.5 }, f.svg);
+          el('line', { x1: cx - w / 4, x2: cx + w / 4, y1: y(hi), y2: y(hi), stroke: 'var(--s1)', 'stroke-width': 1.5 }, f.svg);
+          el('rect', { x: cx - w / 2, y: y(q3), width: w, height: Math.max(1, y(q1) - y(q3)), rx: 3,
+            fill: 'var(--s1)', 'fill-opacity': 0.18, stroke: 'var(--s1)', 'stroke-width': 1.5 }, f.svg);
+        }
+        var med = quantile(s, 0.5);
+        el('line', { x1: cx - w / 2, x2: cx + w / 2, y1: y(med), y2: y(med), stroke: 'var(--ink)', 'stroke-width': 2 }, f.svg);
+        // The dots fan out sideways a little so equal times do not hide each other.
+        s.forEach(function (v, k) {
+          var dx = s.length > 1 ? (k / (s.length - 1) - 0.5) * w * 0.8 : 0;
+          el('circle', { class: 'dot', cx: cx + dx, cy: y(v), r: 3.5, fill: 'var(--s1)' }, f.svg);
+        });
+        el('text', { class: 'value', x: cx, y: y(s[s.length - 1]) - 8, 'text-anchor': 'middle' }, f.svg).textContent = 'n=' + s.length;
+      }
+      hit(f.svg, LEFT + f.band * i, f.band, c.tip);
+    });
+  }
+
+  // The run flow: one node per stage along the top, the grey line between them as thick as the runs still going,
+  // and under each stage the runs that stopped there, one coloured band per way of ending, bending down from the
+  // node to a stack of their own. stops[i] maps an outcome key to how many runs stopped at stage i.
+  function flow(host, stages, names, stops, kinds, total) {
+    if (!total) { host.innerHTML = '<p class="empty">No runs yet.</p>'; return; }
+    host.innerHTML = '';
+    var W = Math.max(320, host.clientWidth), NODE = 8;
+    var step = (W - 24 - NODE) / (stages.length - 1), x0 = 12;
+    var y0 = 34, band = 110, k = band / total, dropTop = y0 + band + 40;
+    var still = [];
+    var left = total, deepest = 0;
+    stages.forEach(function (s, i) {
+      still.push(left);
+      var stopped = 0;
+      var depth = 0;
+      for (var key in stops[i]) if (key !== 'Escaped') { stopped += stops[i][key]; depth += Math.max(stops[i][key] * k, 12) + 3; }
+      deepest = Math.max(deepest, depth);
+      left -= stopped;
+    });
+    // As tall as the deepest stack of drop-offs needs, and no taller.
+    var FH = Math.ceil(dropTop + Math.max(deepest, 12) + 12);
+    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + FH, height: FH, role: 'img' }, host);
+    var color = {};
+    kinds.forEach(function (o) { color[o.key] = o.color; });
+    color.Escaped = 'var(--s1)';
+
+    stages.forEach(function (s, i) {
+      var x = x0 + step * i, h = still[i] * k;
+      // The line on to the next stage, as thick as the runs that reached it.
+      if (i < stages.length - 1 && still[i + 1] > 0) {
+        el('rect', { x: x + NODE, y: y0, width: step - NODE, height: still[i + 1] * k, fill: 'var(--ink-2)', 'fill-opacity': 0.18 }, svg);
+      }
+      var last = i === stages.length - 1;
+      if (h > 0) el('rect', { x: x, y: y0, width: NODE, height: h, rx: 2, fill: last ? 'var(--s1)' : 'var(--ink-2)' }, svg);
+      var anchor = i === 0 ? 'start' : last ? 'end' : 'middle', tx = i === 0 ? x : last ? x + NODE : x + NODE / 2;
+      // A phone has no room for "Room 1" between stages: R1, and Esc. for Escaped (the tooltip has the full name).
+      var shortName = step < 60 ? s.replace('Room ', 'R').replace('Escaped', 'Esc.') : s;
+      el('text', { x: tx, y: y0 - 18, 'text-anchor': anchor }, svg).textContent = shortName;
+      el('text', { class: 'value', x: tx, y: y0 - 5, 'text-anchor': anchor }, svg).textContent = still[i];
+
+      // The runs that stopped here: from the bottom of the node (below the line that goes on), each way of ending
+      // bends down and right to its own block.
+      // A band leaves the node's right edge level and arrives at its block level (a plain Sankey link), so the
+      // bands of one stage stack without crossing; each block leaves room for its count.
+      var y = y0 + (last ? h : still[i + 1] * k), by = dropTop, tipLines = [];
+      var x1 = x + NODE, x2 = x + NODE + Math.min(step * 0.5, 44), xm = (x1 + x2) / 2;
+      kinds.forEach(function (o) {
+        var c = stops[i][o.key] || 0;
+        if (!c) return;
+        var t = Math.max(1, c * k);
+        el('path', { d: 'M' + x1 + ',' + y + 'C' + xm + ',' + y + ' ' + xm + ',' + by + ' ' + x2 + ',' + by
+          + 'V' + (by + t) + 'C' + xm + ',' + (by + t) + ' ' + xm + ',' + (y + t) + ' ' + x1 + ',' + (y + t) + 'Z',
+          fill: o.color, 'fill-opacity': 0.55 }, svg);
+        el('rect', { x: x2, y: by, width: NODE, height: t, rx: 2, fill: o.color }, svg);
+        el('text', { class: 'value', x: x2 + NODE + 4, y: by + t / 2 + 4, 'text-anchor': 'start' }, svg).textContent = c;
+        tipLines.push(o.label + ': ' + c);
+        y += t;
+        by += Math.max(t, 12) + 3;
+      });
+      if (last) tipLines.push('Crew escaped: ' + still[i]);
+      var tip = '<b>' + esc(s + (names[i] ? ': ' + names[i] : '')) + '</b>' + plural(still[i], 'run') + ' got here'
+        + (tipLines.length ? '<br>' + (last ? '' : 'stopped here: ') + tipLines.join('<br>') : '<br>none stopped here');
+      var r = el('rect', { class: 'hit', x: x - step / 2 + NODE / 2, y: 0, width: step, height: FH }, svg);
+      r.addEventListener('mousemove', function (e) { showTip(e, tip); });
+      r.addEventListener('mouseleave', hideTip);
     });
   }
 
